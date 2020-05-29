@@ -273,9 +273,7 @@ def _get_array_agg_column(output_column: Column, intermediate_fold_output_name: 
 
 
 def _get_mssql_xml_path_column(
-    output_column: Column,
-    intermediate_fold_output_name: str,
-    traversals: List[SQLFoldTraversalDescriptor],
+    output_column: Column, traversals: List[SQLFoldTraversalDescriptor],
 ) -> Label:
     """Select the MSSQL XML PATH aggregation of the fold output field, labeled as requested.
 
@@ -353,9 +351,17 @@ def _get_mssql_xml_path_column(
         join_clause = _construct_traversal_joins(traversals)
         select_statement = select_statement.select_from(join_clause)
 
+    return select_statement.where(predicate_expression)
+
+
+def _complete_mssql_xml_path_column(
+    select_statement: Label, intermediate_fold_output_name: str, filters: List[BinaryExpression]
+) -> Label:
     # Coalesce to represent empty arrays as '' and return the XML PATH aggregated data with label.
     return func.COALESCE(
-        select_statement.where(predicate_expression).suffix_with("FOR XML PATH ('')").as_scalar(),
+        select_statement.where(sqlalchemy.and_(*filters))
+        .suffix_with("FOR XML PATH ('')")
+        .as_scalar(),
         expression.literal_column("''"),
     ).label(intermediate_fold_output_name)
 
@@ -384,7 +390,6 @@ class FoldSubqueryBuilder(object):
     # The GROUP BY clause is produced during initialization.
     #
     # If a filter occurs on any vertex field inside the fold, a WHERE clause will also be produced.
-    # TODO: implement filters for MSSQL
     #
     # The FROM and JOIN clauses are constructed during end_fold using info from the
     # visit_vertex function.
@@ -437,6 +442,7 @@ class FoldSubqueryBuilder(object):
         # starting with the join from the vertex immediately outside the fold to the folded vertex.
         self._traversal_descriptors: List[SQLFoldTraversalDescriptor] = []
         self._outputs: List[Label] = []  # Output columns for folded subquery.
+        self._mssql_intermediate_output = {}
         self._filters: List[
             BinaryExpression
         ] = []  # SQLAlchemy Expressions to be used in the WHERE clause.
@@ -480,17 +486,13 @@ class FoldSubqueryBuilder(object):
 
     def _construct_fold_subquery(self, subquery_from_clause: Join) -> Select:
         """Combine all parts of the fold object to produce the complete fold subquery."""
-        select_statement = (
-            sqlalchemy.select(self._outputs)
-            .select_from(subquery_from_clause)
-            .where(sqlalchemy.and_(*self._filters))
-        )
+        select_statement = sqlalchemy.select(self._outputs).select_from(subquery_from_clause)
 
         if isinstance(self._dialect, MSDialect):
-            # mssql doesn't rely on a group by
+            # MSSQL doesn't rely on a GROUP BY or WHERE.
             return select_statement
         elif isinstance(self._dialect, PGDialect):
-            return select_statement.group_by(
+            return select_statement.where(sqlalchemy.and_(*self._filters)).group_by(
                 self._outer_vertex_alias.c[self._outer_vertex_primary_key]
             )
         else:
@@ -522,9 +524,7 @@ class FoldSubqueryBuilder(object):
             # to self._outputs.
             if isinstance(self._dialect, MSDialect):
                 # MSSQL uses XML PATH aggregation.
-                return _get_mssql_xml_path_column(
-                    output_column, intermediate_fold_output_name, self._traversal_descriptors,
-                )
+                return _get_mssql_xml_path_column(output_column, self._traversal_descriptors)
             elif isinstance(self._dialect, PGDialect):
                 # PostgreSQL uses ARRAY_AGG.
                 return _get_array_agg_column(output_column, intermediate_fold_output_name)
@@ -567,8 +567,15 @@ class FoldSubqueryBuilder(object):
                         )
                     # Get SQLAlchemy column for fold_output.
                     column_clause = self._get_fold_output_column_clause(fold_output.field)
-                    # Append resulting column to outputs.
-                    self._outputs.append(column_clause)
+                    if isinstance(self._dialect, MSDialect):
+                        self._mssql_intermediate_output[
+                            FOLD_OUTPUT_FORMAT_STRING.format(fold_output.field)
+                        ] = column_clause
+                    elif isinstance(self._dialect, PGDialect):
+                        # Append resulting column to outputs.
+                        self._outputs.append(column_clause)
+                    else:
+                        raise AssertionError()
 
         # Use to join unique identifier for the fold's outer vertex to the final table.
         self._outputs.append(self._outer_vertex_alias.c[self._outer_vertex_primary_key])
@@ -624,10 +631,6 @@ class FoldSubqueryBuilder(object):
                 "Cannot add a filter after end_fold has been called. Invalid "
                 f"state encountered during fold {self}."
             )
-        if isinstance(self._dialect, MSDialect):
-            raise NotImplementedError(
-                "Filtering on fields inside a fold is not implemented for MSSQL yet."
-            )
         # Filters are applied to output vertices, thus current_alias=self.output_vertex_alias.
         sql_expression = predicate.to_sql(self._dialect, aliases, self._output_vertex_alias)
         self._filters.append(sql_expression)
@@ -647,6 +650,14 @@ class FoldSubqueryBuilder(object):
             raise AssertionError(
                 f"No traversed vertices visited. Invalid state encountered during fold {self}."
             )
+
+        if isinstance(self._dialect, MSDialect):
+            if len(self._mssql_intermediate_output) != 1:
+                raise NotImplementedError()
+            for output_name, select_statement in self._mssql_intermediate_output.items():
+                self._outputs.append(
+                    _complete_mssql_xml_path_column(select_statement, output_name, self._filters)
+                )
 
         # For now, folds with multiple outputs are not implemented in MSSQL. Each output comes
         # from its own selectable within the XML PATH statement so it is not guaranteed result order

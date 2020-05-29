@@ -7079,6 +7079,50 @@ class CompilerTests(unittest.TestCase):
             expected_postgresql,
         )
 
+    def test_filter_within_fold_scope_single_output(self):
+        test_data = test_input_data.filter_within_fold_scope_single_output()
+
+        expected_match = SKIP_TEST
+        expected_gremlin = SKIP_TEST
+        expected_mssql = """
+            SELECT
+                folded_subquery_1.fold_output_name AS child_list,
+                [Animal_1].name AS name
+            FROM db_1.schema_1.[Animal] AS [Animal_1]
+            JOIN (
+                SELECT
+                    [Animal_2].uuid AS uuid,
+                    coalesce((
+                        SELECT
+                            '|' + coalesce(
+                                REPLACE(
+                                    REPLACE(
+                                        REPLACE([Animal_3].name, '^', '^e'),
+                                    '~', '^n'),
+                                '|', '^d'),
+                            '~')
+                        FROM db_1.schema_1.[Animal] AS [Animal_3]
+                        WHERE [Animal_2].uuid = [Animal_3].parent
+                        AND ([Animal_3].name LIKE '%' + :desired + '%')
+                        FOR XML PATH ('')
+                    ), '') AS fold_output_name
+                FROM db_1.schema_1.[Animal] AS [Animal_2]
+            ) AS folded_subquery_1
+            ON [Animal_1].uuid = folded_subquery_1.uuid
+        """
+        expected_postgresql = SKIP_TEST
+        expected_cypher = SKIP_TEST
+
+        check_test_data(
+            self,
+            test_data,
+            expected_match,
+            expected_gremlin,
+            expected_mssql,
+            expected_cypher,
+            expected_postgresql,
+        )
+
     def test_filter_on_fold_scope(self):
         test_data = test_input_data.filter_on_fold_scope()
 
